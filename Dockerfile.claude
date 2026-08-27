@@ -12,11 +12,11 @@ RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-
     && echo '' > crates/openab-gateway/src/lib.rs \
     && echo '' > crates/openab-mcp/src/lib.rs \
     && echo '' > crates/openab-cp/src/lib.rs \
-    && cargo build --release \
+    && cargo build --release --features unified \
     && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs && cargo build --release --features unified
 
 # --- Runtime stage ---
 FROM node:22-trixie-slim
