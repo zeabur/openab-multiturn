@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod behavioral_overrides;
 pub(crate) mod media;
 pub mod schema;
 pub mod store;
