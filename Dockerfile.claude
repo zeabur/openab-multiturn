@@ -46,6 +46,7 @@ WORKDIR /home/node
 
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
 
+COPY --chown=node:node scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
 
 USER node
@@ -54,5 +55,5 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 ENV OPENAB_AGENT_COMMAND="claude-agent-acp"
 ENV OPENAB_AGENT_AUTH_COMMAND="claude auth login"
 
-ENTRYPOINT ["tini", "--"]
+ENTRYPOINT ["tini", "--", "entrypoint.sh"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
