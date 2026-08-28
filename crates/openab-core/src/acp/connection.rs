@@ -213,6 +213,15 @@ fn build_agent_env(
         result.insert(k.clone(), expand_env(v));
     }
 
+    // Merge env overrides from the multitenant Router's X-OpenAB-Env header.
+    // Explicit [agent].env values take precedence.
+    for (k, v) in crate::runtime_env::get_overrides() {
+        if !result.contains_key(&k) {
+            result.insert(k.clone(), v);
+            inherited.push(k);
+        }
+    }
+
     for key in inherit_keys {
         if !result.contains_key(key) {
             if let Ok(v) = std::env::var(key) {

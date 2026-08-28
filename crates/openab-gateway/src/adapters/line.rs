@@ -113,6 +113,8 @@ pub async fn webhook(
         }
     };
 
+    crate::behavioral_overrides::apply_from_headers(&headers);
+
     let webhook_received_at = std::time::Instant::now();
     let background_state = state.clone();
     let permit = match background_state

@@ -23,6 +23,7 @@ pub mod filestore;
 pub mod reactions;
 #[cfg(feature = "discord")]
 pub mod remind;
+pub mod runtime_env;
 pub mod secrets;
 pub mod setup;
 pub mod structured_delivery;
