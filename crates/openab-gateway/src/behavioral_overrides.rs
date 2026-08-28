@@ -76,6 +76,12 @@ fn apply_inner(headers: &axum::http::HeaderMap) {
     }
 }
 
+const BEHAVIORAL_MARKER: &str = "<!-- openab:behavioral-profile -->";
+
+/// Append the profile persona to the seeded CLAUDE.md instead of replacing
+/// it, so deployment-level instructions (e.g. reply-format rules from the
+/// pre_seed base layer) survive. A marker keeps the write idempotent: any
+/// previous behavioral section is replaced, not stacked.
 fn write_system_prompt(prompt: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/node".into());
     let dir = format!("{home}/.claude");
@@ -84,8 +90,18 @@ fn write_system_prompt(prompt: &str) {
         tracing::warn!(path = %dir, error = %e, "behavioral: failed to create prompt dir");
         return;
     }
-    match std::fs::write(&path, prompt) {
-        Ok(()) => tracing::info!(path, chars = prompt.len(), "behavioral: wrote system prompt"),
+    let base = std::fs::read_to_string(&path).unwrap_or_default();
+    let base = match base.find(BEHAVIORAL_MARKER) {
+        Some(idx) => base[..idx].trim_end().to_string(),
+        None => base.trim_end().to_string(),
+    };
+    let combined = if base.is_empty() {
+        format!("{BEHAVIORAL_MARKER}\n{prompt}\n")
+    } else {
+        format!("{base}\n\n{BEHAVIORAL_MARKER}\n{prompt}\n")
+    };
+    match std::fs::write(&path, combined) {
+        Ok(()) => tracing::info!(path, chars = prompt.len(), "behavioral: appended system prompt"),
         Err(e) => tracing::warn!(path, error = %e, "behavioral: failed to write system prompt"),
     }
 }
@@ -101,5 +117,22 @@ mod tests {
         assert!(!has_any_header(&h));
         h.insert("x-openab-env", "test".parse().unwrap());
         assert!(has_any_header(&h));
+    }
+
+    #[test]
+    fn write_system_prompt_appends_to_base_and_is_idempotent() {
+        let tmp = std::env::temp_dir().join(format!("oab-bhv-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::write(tmp.join(".claude/CLAUDE.md"), "## Base format rules\n").unwrap();
+        // SAFETY: test-local HOME override; tests in this module run serially
+        // for this var and nothing else in-process reads HOME concurrently.
+        std::env::set_var("HOME", &tmp);
+        write_system_prompt("Persona v1");
+        write_system_prompt("Persona v2");
+        let out = std::fs::read_to_string(tmp.join(".claude/CLAUDE.md")).unwrap();
+        assert!(out.starts_with("## Base format rules"), "base must survive: {out}");
+        assert!(out.contains("Persona v2"));
+        assert!(!out.contains("Persona v1"), "old section must be replaced: {out}");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
