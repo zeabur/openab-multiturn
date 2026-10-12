@@ -1,7 +1,7 @@
 use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,6 +49,39 @@ struct PoolState {
     /// Per-session working directory overrides (from control directives).
     /// thread_key → canonical workspace path.
     session_workdirs: HashMap<String, String>,
+}
+
+/// A completed durable reset distinguishes existing conversation state from a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetOutcome {
+    Reset,
+    AlreadyFresh,
+}
+
+/// Gateway control replies are deterministic: errors must never masquerade as a reset.
+pub fn reset_reply(result: Result<ResetOutcome>, dropped: usize) -> String {
+    let prefix = match result {
+        Ok(ResetOutcome::Reset) => "🔄 Session reset.",
+        Ok(ResetOutcome::AlreadyFresh) => "🔄 Conversation is already fresh.",
+        Err(error) => {
+            warn!(error = %error, "session reset failed");
+            return "⚠️ Session reset failed. Please try again.".to_string();
+        }
+    };
+    if dropped == 0 {
+        format!("{prefix} Start a new conversation!")
+    } else {
+        format!("{prefix} Dropped {dropped} buffered message(s). Start a new conversation!")
+    }
+}
+
+/// Save a reset's durable state with errors propagated, unlike best-effort idle snapshots.
+fn save_reset_mapping(path: &Path, mapping: &HashMap<String, String>) -> Result<()> {
+    let data = serde_json::to_string_pretty(mapping)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data).context("write reset state")?;
+    std::fs::rename(&tmp, path).context("commit reset state")?;
+    Ok(())
 }
 
 pub struct SessionPool {
@@ -814,7 +847,14 @@ impl SessionPool {
     /// and clear all suspended state. The ACP process will be killed once the last
     /// Arc reference is dropped (after streaming finishes). The next message will
     /// trigger a fresh `get_or_create` with a new ACP session.
-    pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+    pub async fn reset_session(&self, thread_id: &str) -> Result<ResetOutcome> {
+        // Serialize reset with creation/resumption so a late creation cannot resurrect
+        // the predecessor after reset has reported success. Preserve this gate.
+        let create_gate = {
+            let mut state = self.state.write().await;
+            get_or_insert_gate(&mut state.creating, thread_id)
+        };
+        let _create_guard = create_gate.lock().await;
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -836,7 +876,21 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        let had_active = state.active.remove(thread_id).is_some();
+        let had_session = state.active.contains_key(thread_id)
+            || state.suspended.contains_key(thread_id)
+            || state.persisted.contains_key(thread_id)
+            || state.session_workdirs.contains_key(thread_id);
+        let mut persisted = state.persisted.clone();
+        persisted.remove(thread_id);
+        let mut workdirs = state.session_workdirs.clone();
+        workdirs.remove(thread_id);
+        // Commit metadata first and the resumable mapping last. If either write fails,
+        // keep in-memory state so the caller can retry and do not claim success.
+        // These are separate files; a metadata-only commit can precede a failed mapping
+        // write, but the session id remains resumable and the reset returns an error.
+        save_reset_mapping(&self.meta_path, &workdirs)?;
+        save_reset_mapping(&self.mapping_path, &persisted)?;
+        state.active.remove(thread_id);
         // Everything else a reset clears is exactly what hung eviction clears, including the rule
         // that the creating gate survives. Call the one implementation rather than keeping a second
         // copy of the list: the copies are what let the two drift, and the gate rule is precisely
@@ -846,14 +900,12 @@ impl SessionPool {
         // guard cannot revoke — do it synchronously here too (F3).
         #[cfg(feature = "acp-mcp")]
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
-        self.save_mapping(&state.persisted);
-        self.save_meta(&state.session_workdirs);
-        if had_active {
-            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
-            Ok(())
+        info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
+        Ok(if had_session {
+            ResetOutcome::Reset
         } else {
-            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
-        }
+            ResetOutcome::AlreadyFresh
+        })
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
@@ -1022,15 +1074,150 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        remove_if_same_handle, PoolState, SessionPool,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, RwLock};
+    use std::path::Path;
+    use crate::config::AgentConfig;
     use tokio::time::Instant;
 
     /// Registrar double that records every mint, so a test can assert one never happened.
+    fn reset_test_pool(dir: &Path) -> SessionPool {
+        SessionPool {
+            state: RwLock::new(PoolState {
+                active: HashMap::new(),
+                cancel_handles: HashMap::new(),
+                #[cfg(feature = "acp-mcp")]
+                facade_tokens: HashMap::new(),
+                activity: HashMap::new(),
+                pgids: HashMap::new(),
+                suspended: HashMap::new(),
+                persisted: HashMap::new(),
+                creating: HashMap::new(),
+                session_workdirs: HashMap::new(),
+            }),
+            config: AgentConfig::default(),
+            max_sessions: 2,
+            hung_threshold_secs: 60,
+            mapping_path: dir.join("thread_map.json"),
+            meta_path: dir.join("session_meta.json"),
+            default_config_options: HashMap::new(),
+            #[cfg(feature = "acp-mcp")]
+            session_registrar: None,
+            #[cfg(feature = "acp-mcp")]
+            facade_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_cold_session_removes_restart_resume_state_and_preserves_other_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = reset_test_pool(dir.path());
+        let history = dir.path().join("agent-history.json");
+        std::fs::write(&history, "preserve history").unwrap();
+        {
+            let mut state = pool.state.write().await;
+            state.suspended.insert("cold".into(), "old-session".into());
+            state.persisted.insert("cold".into(), "old-session".into());
+            state
+                .persisted
+                .insert("other".into(), "other-session".into());
+            state
+                .session_workdirs
+                .insert("cold".into(), "/workspace".into());
+            pool.save_mapping(&state.persisted);
+            pool.save_meta(&state.session_workdirs);
+        }
+        assert_eq!(
+            pool.reset_session("cold").await.unwrap(),
+            super::ResetOutcome::Reset
+        );
+        assert!(!pool.has_active_session("cold").await);
+        let reloaded = SessionPool::load_mapping(&pool.mapping_path);
+        assert!(
+            !reloaded.contains_key("cold"),
+            "restart must not resume the old session"
+        );
+        assert_eq!(reloaded.get("other").unwrap(), "other-session");
+        assert!(!SessionPool::load_mapping(&pool.meta_path).contains_key("cold"));
+        assert_eq!(
+            std::fs::read_to_string(history).unwrap(),
+            "preserve history"
+        );
+        assert!(
+            pool.reset_session("cold").await.is_ok(),
+            "repeat reset is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_warm_session_drops_active_handle_and_persisted_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = reset_test_pool(dir.path());
+        let conn = crate::acp::connection::AcpConnection::spawn(
+            "/bin/cat",
+            &[],
+            dir.path().to_str().unwrap(),
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = pool.state.write().await;
+            state
+                .active
+                .insert("warm".into(), Arc::new(Mutex::new(conn)));
+            state.persisted.insert("warm".into(), "old-session".into());
+        }
+        assert_eq!(
+            pool.reset_session("warm").await.unwrap(),
+            super::ResetOutcome::Reset
+        );
+        assert!(!pool.has_active_session("warm").await);
+        assert!(!SessionPool::load_mapping(&pool.mapping_path).contains_key("warm"));
+    }
+
+    #[test]
+    fn reset_reply_distinguishes_completed_fresh_and_failed_results() {
+        assert_eq!(
+            super::reset_reply(Ok(super::ResetOutcome::Reset), 0),
+            "🔄 Session reset. Start a new conversation!"
+        );
+        assert_eq!(
+            super::reset_reply(Ok(super::ResetOutcome::AlreadyFresh), 0),
+            "🔄 Conversation is already fresh. Start a new conversation!"
+        );
+        assert_eq!(
+            super::reset_reply(Err(anyhow::anyhow!("disk unavailable")), 0),
+            "⚠️ Session reset failed. Please try again."
+        );
+        assert_eq!(
+            super::reset_reply(Ok(super::ResetOutcome::Reset), 2),
+            "🔄 Session reset. Dropped 2 buffered message(s). Start a new conversation!"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_write_failure_is_reported_and_keeps_session_resumable_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = reset_test_pool(dir.path());
+        pool.mapping_path = dir.path().join("missing/thread_map.json");
+        {
+            let mut state = pool.state.write().await;
+            state.suspended.insert("cold".into(), "old-session".into());
+            state.persisted.insert("cold".into(), "old-session".into());
+        }
+        assert!(pool.reset_session("cold").await.is_err());
+        assert!(
+            pool.has_active_session("cold").await,
+            "failed durability must not silently discard memory state"
+        );
+    }
+
     #[cfg(feature = "acp-mcp")]
     #[derive(Default)]
     struct CountingRegistrar {

@@ -9,7 +9,7 @@ OpenAB registers Discord slash commands for session control and agent management
 | `/models` | Select the AI model via dropdown menu | Yes |
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
-| `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
+| `/reset` | Reset the conversation session (start fresh) | Yes |
 | `/auth` | Authenticate the backend agent via device flow (**DM-only**) | No |
 | `/remind` | Set a one-shot delayed reminder to mention users/roles | No |
 | `/export-thread` | Export thread/DM as `.txt` (default: last 100 messages) | No |
@@ -56,18 +56,19 @@ Sends a `session/cancel` JSON-RPC notification to the ACP backend. This aborts i
 
 ### `/reset`
 
-Cancels any in-flight operation, then removes the session from the pool. The ACP process terminates once the last reference is released. The next message in the thread or DM will automatically create a fresh session.
+Cancels any in-flight operation, then removes the session from the pool. The ACP process terminates once the last reference is released. The next message in the thread or DM will automatically create a fresh session. Active, suspended, and persisted sessions are all reset. An already-fresh conversation reports that state; a persistence error reports a failed reset so you can retry.
 
 This is equivalent to the `sessions close` + `sessions new` pattern used by [OpenClaw ACPX](https://github.com/openclaw/acpx).
 
 **What gets cleared:**
-- Conversation history
+- The current conversation context and resumable session mapping
 - ACP process and connection
 - Suspended session state (no resume after reset)
 
 **What is preserved:**
 - Bot identity and system prompt (re-applied on next session creation)
 - Config settings in `config.toml`
+- Existing chat messages, agent history files, workspace files, and external user resources
 
 ### `/export-thread`
 

@@ -1800,19 +1800,7 @@ impl Handler {
 
         let result = self.router.pool().reset_session(&session_key).await;
 
-        let msg = match result {
-            Ok(()) if dropped > 0 => {
-                format!("🔄 Session reset. Dropped {dropped} buffered message(s). Start a new conversation!")
-            }
-            Ok(()) => "🔄 Session reset. Start a new conversation!".to_string(),
-            Err(_) if dropped > 0 => {
-                format!("🔄 Dropped {dropped} buffered message(s). No active session to reset.")
-            }
-            Err(_) => {
-                "⚠️ No active session to reset. Start a conversation first by @mentioning the bot."
-                    .to_string()
-            }
-        };
+        let msg = crate::acp::pool::reset_reply(result, dropped);
 
         let response = CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
